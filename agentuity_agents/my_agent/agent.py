@@ -20,7 +20,11 @@ try:
 except Exception:
     PIL_AVAILABLE = False
 
-client = AsyncOpenAI()
+# Configure OpenAI client to use OpenRouter
+client = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY"),
+)
 
 # =========================
 # Helpers: normalization + expirations
@@ -304,7 +308,6 @@ async def extract_from_image(content_type: str, image_bytes: bytes, ctx: AgentCo
                 "content": [
                     {"type": "input_text", "text": "Extract grocery ingredients/items visible in the image. Output ONLY JSON as {\"items\":[...]} with short generic names (no quantities)."},
                     {"type": "input_image", "image_url": {"url": data_url}},
-                    {"type": "input_image", "image_url": data_url},
                 ],
             }],
             response_format={
@@ -342,7 +345,6 @@ async def extract_from_image(content_type: str, image_bytes: bytes, ctx: AgentCo
                 {"role": "user", "content": [
                     {"type": "text", "text": "Return JSON only."},
                     {"type": "image_url", "image_url": {"url": data_url}},
-                    {"type": "image_url", "image_url": data_url},
                 ]},
             ],
             temperature=0
@@ -568,7 +570,7 @@ async def generate_and_store_video(context: AgentContext, request: AgentRequest,
     params = {"prompt": prompt}
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client_httpx:
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client_httpx:
             r = await client_httpx.get(url, params=params, headers=headers)
             if r.status_code != 200:
                 context.logger.error(f"Video endpoint returned status {r.status_code}: {r.text}")
