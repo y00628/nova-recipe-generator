@@ -391,10 +391,52 @@ async def run(request: AgentRequest, response: AgentResponse, context: AgentCont
         recipe_text = await llm_recipe_text(items_text)
         vids = await youtube_search(f"how to make {items_text.split(',')[0].strip()}") if items_text else []
 
+        # === Optional video generation ===
+        video_info: Optional[Dict[str, Any]] = None
+
+        # Try to read JSON/body or metadata for generation flags
+        body = None
+        try:
+            if hasattr(request, "json"):
+                body = await _maybe_await(request.json())
+        except Exception:
+            body = None
+
+        meta = None
+        try:
+            if hasattr(request, "metadata"):
+                meta = await _maybe_await(request.metadata())
+        except Exception:
+            meta = None
+
+        gen_flag = False
+        if isinstance(body, dict) and body.get("generate_video"):
+            gen_flag = True
+        if isinstance(meta, dict) and meta.get("generate_video"):
+            gen_flag = True
+
+        # If the caller selected a specific recipe to generate, use that
+        selected_recipe_text = None
+        if isinstance(body, dict) and body.get("action") == "select_recipe":
+            selected_recipe_text = body.get("recipe") or body.get("recipe_text")
+            gen_flag = True
+        elif isinstance(meta, dict) and meta.get("action") == "select_recipe":
+            selected_recipe_text = meta.get("recipe")
+            gen_flag = True
+
+        if gen_flag:
+            prompt_text = selected_recipe_text or recipe_text
+            try:
+                video_info = await generate_and_store_video(context, request, prompt_text)
+            except Exception as e:
+                context.logger.error(f"Video generation helper failed: {e}")
+                video_info = {"error": "video_generation_exception"}
+
         return response.json({
             "items": items_struct,
             "recipe": recipe_text,
             "videos": vids,
+            "generated_video": video_info,
         })
 
     except Exception as e:
@@ -408,3 +450,33 @@ async def run(request: AgentRequest, response: AgentResponse, context: AgentCont
                 '{"dataUrl":"data:image/jpeg;base64,...."}'
             ),
         })
+
+
+async def generate_and_store_video(context: AgentContext, request: AgentRequest, prompt: str) -> Dict[str, Any]:
+    """Generate a video via the ScottyLabs endpoint and store it in KV.
+
+    Returns metadata dict with key/size or error.
+    """
+    url = "https://ops-5--example-wan2-generate-video-http.modal.run"
+    headers = {"Accept": "video/mp4"}
+    params = {"prompt": prompt}
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.get(url, params=params, headers=headers)
+            if r.status_code != 200:
+                context.logger.error(f"Video endpoint returned status {r.status_code}: {r.text}")
+                return {"error": "video_endpoint_error", "status": r.status_code}
+            content = r.content
+    except Exception as e:
+        context.logger.error(f"Error calling video endpoint: {e}")
+        return {"error": "video_call_exception"}
+
+    # store in KV as base64 so it's JSON-serializable
+    key = f"video:{int(datetime.utcnow().timestamp())}:{getattr(request, 'user_id', None) or (await _maybe_await(request.json())).get('user_id') if hasattr(request, 'json') else 'owner'}"
+    try:
+        await context.kv.set("videos", key, base64.b64encode(content).decode())
+        return {"key": key, "size_bytes": len(content)}
+    except Exception as e:
+        context.logger.warn(f"Could not persist generated video to KV: {e}")
+        return {"size_bytes": len(content)}
