@@ -3,6 +3,8 @@ from agentuity import AgentRequest, AgentResponse, AgentContext
 from openai import AsyncOpenAI
 import io
 import base64
+import requests
+import time
 
 client = AsyncOpenAI()
 
@@ -65,6 +67,63 @@ async def _read_image_bytes(request: AgentRequest) -> Optional[bytes]:
         b = getattr(request.data, "body", None) or getattr(request.data, "bytes", None)
         if isinstance(b, (bytes, bytearray)):
             return bytes(b)
+    except Exception:
+        pass
+
+    # Try extracting from multipart/form-data: common when uploading via HTML forms
+    try:
+        # many frameworks expose an async form() method
+        form = None
+        try:
+            form = await request.data.form()
+        except Exception:
+            # try synchronous attribute
+            form = getattr(request.data, "form", None)
+
+        if form:
+            # form may be a dict-like mapping of fields to values / file objects
+            items = form.items() if hasattr(form, "items") else form
+            for key, val in items:
+                # common file-like objects: have .read or .file or .filename
+                try:
+                    if hasattr(val, "read") and callable(val.read):
+                        data = val.read()
+                        if isinstance(data, (bytes, bytearray)):
+                            return bytes(data)
+                        # if read returned awaitable, await it
+                        try:
+                            # handle async readables
+                            data_a = await data
+                            if isinstance(data_a, (bytes, bytearray)):
+                                return bytes(data_a)
+                        except Exception:
+                            pass
+
+                    # Some frameworks wrap uploaded files in objects with .file (a stream)
+                    if hasattr(val, "file"):
+                        f = getattr(val, "file")
+                        try:
+                            data = f.read()
+                            if isinstance(data, (bytes, bytearray)):
+                                return bytes(data)
+                        except Exception:
+                            try:
+                                data_a = await f.read()
+                                if isinstance(data_a, (bytes, bytearray)):
+                                    return bytes(data_a)
+                            except Exception:
+                                pass
+
+                    # Starlette/fastapi UploadFile has .file and async .read
+                    if hasattr(val, "filename") and hasattr(val, "read"):
+                        try:
+                            data = await val.read()
+                            if isinstance(data, (bytes, bytearray)):
+                                return bytes(data)
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
     except Exception:
         pass
 
@@ -152,10 +211,56 @@ async def run(request: AgentRequest, response: AgentResponse, context: AgentCont
 
         recipe_text = recipe_result.choices[0].message.content
 
+        # Optionally generate a tutorial video using the ScottyLabs endpoint.
+        # The client may request this by providing 'generate_video' in request.get(...) or metadata.
+        gen_flag = False
+        try:
+            gen_flag = bool(request.get("generate_video", False))
+        except Exception:
+            try:
+                md = await request.metadata()
+                gen_flag = bool(md.get("generate_video", False)) if md else False
+            except Exception:
+                gen_flag = False
+
+        video_info = None
+        if gen_flag:
+            # craft a prompt for the video generator from the recipe text
+            prompt = f"Create a short, clear cooking tutorial video that demonstrates the following recipe and steps: {recipe_text}"
+
+            def _call_scotty(prompt_text: str, timeout: int = 60) -> Optional[bytes]:
+                """Call the ScottyLabs video-generation endpoint and return raw bytes or None on failure."""
+                try:
+                    url = "https://ops-5--example-wan2-generate-video-http.modal.run"
+                    r = requests.get(url, params={"prompt": prompt_text}, headers={"Accept": "video/mp4"}, timeout=timeout)
+                    if r.status_code == 200:
+                        return r.content
+                    else:
+                        context.logger.warn("Video endpoint returned status %s", r.status_code)
+                        return None
+                except Exception as e:
+                    context.logger.error("Error calling video endpoint: %s", e)
+                    return None
+
+            # Execute call (blocking). In production consider running this asynchronously or as a background job.
+            video_bytes = _call_scotty(prompt)
+            if video_bytes:
+                # store video in KV as base64 to keep it as JSON-serializable data.
+                key = f"video:{int(time.time())}:{request.get('user_id','default_owner') if hasattr(request, 'get') else 'default_owner'}"
+                try:
+                    await context.kv.set("videos", key, base64.b64encode(video_bytes).decode())
+                    video_info = {"key": key, "size_bytes": len(video_bytes)}
+                except Exception:
+                    context.logger.warn("Could not persist generated video to KV; returning inline metadata")
+                    video_info = {"size_bytes": len(video_bytes)}
+            else:
+                video_info = {"error": "video_generation_failed"}
+
         return response.json({
             "ok": True,
             "ingredients": user_input,
             "recipe": recipe_text,
+            "video": video_info,
         })
 
     except Exception as e:
