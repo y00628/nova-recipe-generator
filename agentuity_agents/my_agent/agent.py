@@ -13,6 +13,13 @@ import httpx  # pip install httpx
 from agentuity import AgentRequest, AgentResponse, AgentContext
 from openai import AsyncOpenAI
 
+# Optional: image normalization if Pillow available (handles HEIC/WEBP/etc.)
+try:
+    from PIL import Image  # pip install pillow ; optionally pillow-heif to decode HEIC
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
+
 client = AsyncOpenAI()
 
 # =========================
@@ -76,7 +83,7 @@ def estimate_expiry(name: str, start: Optional[datetime] = None) -> Optional[str
 # =========================
 
 LIST_SPLIT = re.compile(r"[,;\n]|\band\b", re.I)
-DATA_URL_RE = re.compile(r"^data:(?P<ctype>[^;]+);base64,(?P<b64>.+)$", re.I)
+DATA_URL_RE = re.compile(r"^data:(?P<ctype>[^;]+);\s*base64,\s*(?P<b64>.+)$", re.I | re.S)
 
 def parse_free_text(text: str) -> List[str]:
     parts = [p.strip() for p in LIST_SPLIT.split(text or "")]
@@ -107,13 +114,46 @@ def _try_decode_b64(s: str) -> Optional[bytes]:
     except Exception:
         return None
 
+def _sniff_image_type(b: bytes) -> Optional[str]:
+    if b.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if b.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if b.startswith(b"GIF87a") or b.startswith(b"GIF89a"):
+        return "image/gif"
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return "image/webp"
+    if b[4:8] == b"ftyp" and any(tag in b[8:16] for tag in (b"heic", b"heix", b"hevc", b"mif1", b"heif")):
+        return "image/heic"
+    return None
+
+def _normalize_image_for_vision(b: bytes, ctx: AgentContext) -> Optional[bytes]:
+    """
+    Best-effort: convert any format to RGB JPEG (max side 1600px, quality 85).
+    Returns JPEG bytes or None if Pillow not available/fails.
+    """
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        from io import BytesIO
+        bio = BytesIO(b)
+        img = Image.open(bio)
+        # Some HEIC decoders are provided by pillow-heif; if not installed, this may fail earlier.
+        img = img.convert("RGB")
+        # Downscale if huge
+        max_side = 1600
+        w, h = img.size
+        if max(w, h) > max_side:
+            scale = max_side / float(max(w, h))
+            img = img.resize((int(w * scale), int(h * scale)))
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=85, optimize=True)
+        return out.getvalue()
+    except Exception as e:
+        ctx.logger.warn(f"Image normalize failed (non-fatal): {e}")
+        return None
+
 async def _get_first_file_bytes_from_request(request: AgentRequest, context: AgentContext) -> Optional[bytes]:
-    """
-    Probe common places Agentuity environments carry uploads:
-    - request.files / request.file
-    - request.attachments / request.uploads
-    Each entry may expose .read(), .bytes(), .stream, .file, .content, .body, .getvalue(), etc.
-    """
     containers = []
     for attr in ("files", "file", "attachments", "uploads"):
         if hasattr(request, attr):
@@ -164,18 +204,8 @@ async def _get_first_file_bytes_from_request(request: AgentRequest, context: Age
     return None
 
 async def _get_bytes_from_anywhere(request: AgentRequest, context: AgentContext) -> Optional[bytes]:
-    """
-    Aggressively try:
-      A) request.data.* interfaces
-      B) request.json() dict: image/file/payload/body/dataUrl/data_url/base64/b64
-      C) request.files / request.attachments / request.uploads
-      D) request.data.text() as data URL or raw base64
-      E) request.data as dict with the same keys
-    Returns bytes or None (caller may still choose to treat text as data URL path).
-    """
     data = getattr(request, "data", None)
 
-    # A) direct binary-like on request.data
     if data is not None:
         b = _maybe_bytes(data)
         if b is not None:
@@ -188,7 +218,6 @@ async def _get_bytes_from_anywhere(request: AgentRequest, context: AgentContext)
                 if b is not None:
                     return b
 
-    # B) request.json() – dict payloads carrying image data or data-url/base64
     if hasattr(request, "json"):
         try:
             body = await _maybe_await(request.json())
@@ -207,12 +236,10 @@ async def _get_bytes_from_anywhere(request: AgentRequest, context: AgentContext)
         except Exception:
             pass
 
-    # C) files/attachments
     from_req = await _get_first_file_bytes_from_request(request, context)
     if from_req is not None:
         return from_req
 
-    # D) data.text() as data URL or raw base64
     if data is not None and hasattr(data, "text"):
         try:
             t = await _maybe_await(data.text())
@@ -223,7 +250,6 @@ async def _get_bytes_from_anywhere(request: AgentRequest, context: AgentContext)
         except Exception:
             pass
 
-    # E) request.data as dict with common keys
     if isinstance(data, dict):
         for k in ("bytes", "binary", "content", "body", "image", "file", "payload", "data"):
             if k in data:
@@ -237,46 +263,115 @@ async def _get_bytes_from_anywhere(request: AgentRequest, context: AgentContext)
                 if decoded is not None:
                     return decoded
 
-    # Nothing found
     return None
 
 # =========================
-# LLM calls (no temperature params)
+# LLM calls (Vision extraction + Recipe)
 # =========================
 
-async def extract_from_image(content_type: str, image_bytes: bytes, ctx: AgentContext) -> List[str]:
-    data_url = f"data:{content_type};base64,{base64.b64encode(image_bytes).decode()}"
-    try:
-        out = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Extract grocery ingredients/items. Output only JSON: {\"items\":[\"...\"]}"},
-                {"role": "user", "content": [
-                    {"type": "text", "text": "List all ingredients you see as short names (no quantities)."},
-                    {"type": "image_url", "image_url": data_url},
-                ]},
-            ],
-        )
-        raw = out.choices[0].message.content or ""
+async def extract_from_image(content_type: str, image_bytes: bytes, ctx: AgentContext, debug: bool = False, diag: Optional[dict] = None) -> List[str]:
+    """
+    Prefer Responses API (JSON schema). Fallback to Chat Completions (JSON mode).
+    Optionally normalizes the image (RGB JPEG) if Pillow is available.
+    """
+    # Normalize image for maximum compatibility (handles HEIC/WEBP, big images, weird metadata)
+    normalized = _normalize_image_for_vision(image_bytes, ctx)
+    if normalized:
+        image_bytes = normalized
+        content_type = "image/jpeg"
+        if debug and isinstance(diag, dict):
+            diag.setdefault("notes", []).append("image-normalized->jpeg")
+
+    b64 = base64.b64encode(image_bytes).decode()
+    data_url = f"data:{content_type};base64,{b64}"
+
+    def _to_items(raw: str) -> List[str]:
         try:
             obj = json.loads(raw)
             items = obj.get("items")
             if isinstance(items, list):
-                return [str(x).strip() for x in items if str(x).strip()][:40]
+                return [str(s).strip() for s in items if str(s).strip()][:40]
         except Exception:
             pass
         return parse_free_text(raw)
+
+    # 1) Responses API
+    try:
+        resp = await client.responses.create(
+            model="gpt-4o-mini",
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Extract grocery ingredients/items visible in the image. Output ONLY JSON as {\"items\":[...]} with short generic names (no quantities)."},
+                    {"type": "input_image", "image_url": {"url": data_url}},
+                    {"type": "input_image", "image_url": data_url},
+                ],
+            }],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ingredients_schema",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "items": {"type": "array", "items": {"type": "string"}, "maxItems": 40}
+                        },
+                        "required": ["items"],
+                        "additionalProperties": False
+                    }
+                }
+            },
+        )
+        raw = resp.output_text or ""
+        items = _to_items(raw)
+        if items:
+            if debug and isinstance(diag, dict):
+                diag.setdefault("notes", []).append(f"vision-ok(responses):{len(items)}")
+            return items
     except Exception as e:
-        ctx.logger.error(f"Vision extract failed: {e}\n{traceback.format_exc()}")
-        return []
+        ctx.logger.error(f"Responses extractor failed: {e}\n{traceback.format_exc()}")
+
+    # 2) Chat Completions fallback
+    try:
+        comp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "Extract grocery items you can clearly see. Output ONLY JSON: {\"items\":[\"...\"]}. Short generic names; no quantities."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Return JSON only."},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                    {"type": "image_url", "image_url": data_url},
+                ]},
+            ],
+            temperature=0
+        )
+        raw = comp.choices[0].message.content or ""
+        items = _to_items(raw)
+        if items:
+            if debug and isinstance(diag, dict):
+                diag.setdefault("notes", []).append(f"vision-ok(chat):{len(items)}")
+            return items
+    except Exception as e:
+        ctx.logger.error(f"Chat extractor failed: {e}\n{traceback.format_exc()}")
+
+    return []
 
 async def llm_recipe_text(items_text: str) -> str:
     comp = await client.chat.completions.create(
-        model="gpt-5-mini",
+        model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "You are a chef assistant that creates concise recipes from given ingredients."},
-            {"role": "user", "content": f"I have: {items_text}. Suggest a recipe and describe steps."}
+            {"role": "system",
+             "content": ("You are a concise chef assistant. Suggest ONE recipe that uses ONLY the listed ingredients. "
+                         "If a crucial item is missing, state it briefly instead of inventing substitutes. "
+                         "No pasta unless 'pasta' is explicitly in the list.")},
+            {"role": "user",
+             "content": (f"My ingredients: {items_text}\n"
+                         "Return 3 short parts:\n"
+                         "1) Title\n2) Ingredients used\n3) Steps (3-6 bullets)\n")},
         ],
+        temperature=0.2,
     )
     return comp.choices[0].message.content or "No recipe generated."
 
@@ -285,12 +380,10 @@ async def youtube_search(query: str, max_results: int = 3) -> List[str]:
     key = os.getenv("YOUTUBE_KEY")
     if not key:
         return []
-    url = (
-        "https://www.googleapis.com/youtube/v3/search"
-        f"?part=snippet&type=video&maxResults={max_results}&q={httpx.QueryParams({'q': query})['q']}&key={key}"
-    )
+    url = "https://www.googleapis.com/youtube/v3/search"
+    params = {"part": "snippet", "type": "video", "maxResults": str(max_results), "q": query, "key": key}
     async with httpx.AsyncClient(timeout=20) as hx:
-        r = await hx.get(url)
+        r = await hx.get(url, params=params)
         if r.status_code != 200:
             return []
         data = r.json()
@@ -319,23 +412,44 @@ async def run(request: AgentRequest, response: AgentResponse, context: AgentCont
         ctype = (getattr(request.data, "content_type", "") or "").lower()
         items_raw: List[str] = []
 
-        # ========= IMAGE PATHS =========
-        if "image" in ctype or ctype.startswith("multipart/"):
-            # Try to fetch bytes from *any* supported path
-            image_bytes = await _get_bytes_from_anywhere(request, context)
-            if image_bytes is None:
-                # If we cannot get bytes, we still try the TEXT path below, which now
-                # can parse a data URL or base64 in the body and treat it as an image.
-                pass
-            else:
-                items_raw = await extract_from_image(ctype or "image/jpeg", image_bytes, context)
+        # Debug flag
+        debug = False
+        try:
+            if hasattr(request, "json"):
+                jb = await _maybe_await(request.json())
+                if isinstance(jb, dict) and jb.get("debug") is True:
+                    debug = True
+        except Exception:
+            pass
 
-        # ========= TEXT / JSON (also handles data URLs) =========
+        diag = {"debug": debug, "had_bytes": False, "byte_count": 0, "inferred_ctype": None, "initial_ctype": ctype, "notes": []}
+
+        # Try to pull bytes from anywhere (covers JSON dataUrl/base64 too)
+        image_bytes_any = await _get_bytes_from_anywhere(request, context)
+
+        if image_bytes_any is not None and len(image_bytes_any) > 0:
+            diag["had_bytes"] = True
+            diag["byte_count"] = len(image_bytes_any)
+
+            sniffed = _sniff_image_type(image_bytes_any)
+            inferred_ctype = sniffed or ("image/jpeg" if not ctype or "image" not in ctype else ctype)
+            diag["inferred_ctype"] = inferred_ctype
+            if sniffed and ctype and sniffed != ctype:
+                diag["notes"].append(f"Overrode content_type '{ctype}' with sniffed '{sniffed}'")
+
+            # Vision extraction
+            items_raw = await extract_from_image(inferred_ctype, image_bytes_any, context, debug=debug, diag=diag)
+        else:
+            if image_bytes_any is None:
+                diag["notes"].append("No bytes returned by _get_bytes_from_anywhere()")
+            else:
+                diag["notes"].append("Zero-length bytes returned")
+
+        # Text/JSON path if nothing extracted
         if not items_raw:
             txt = ""
             data = getattr(request, "data", None)
 
-            # (1) data.text()
             if data is not None and hasattr(data, "text"):
                 try:
                     t = data.text()
@@ -343,35 +457,35 @@ async def run(request: AgentRequest, response: AgentResponse, context: AgentCont
                 except Exception:
                     txt = ""
 
-            # (2) request.json()
             if hasattr(request, "json"):
                 try:
                     body = await _maybe_await(request.json())
                     if isinstance(body, dict):
-                        # Accept plain text under "text"/"ingredients" AND
-                        # image data via dataUrl/data_url/base64/b64/image
                         txt = body.get("text") or body.get("ingredients") or txt
                         for k in ("dataUrl", "dataURL", "data_url", "base64", "b64", "image"):
                             v = body.get(k)
                             if isinstance(v, str) and v.strip():
-                                txt = v  # let data URL/base64 override plain text
+                                txt = v
                                 break
                 except Exception:
                     pass
 
-            # (3) If txt is a data URL or raw base64, treat as image now
+            if debug and isinstance(txt, str):
+                diag["notes"].append(f"text-len={len(txt)} (first 32 chars: {txt[:32]!r})")
+
             maybe_img = _try_decode_b64(txt) if isinstance(txt, str) else None
             if maybe_img is not None:
+                if debug:
+                    diag["notes"].append(f"Decoded base64/dataURL to {len(maybe_img)} bytes")
                 inferred_ctype = "image/jpeg"
                 m = DATA_URL_RE.match(txt.strip()) if isinstance(txt, str) else None
                 if m:
                     inferred_ctype = m.group("ctype") or inferred_ctype
-                items_raw = await extract_from_image(inferred_ctype, maybe_img, context)
+                items_raw = await extract_from_image(inferred_ctype, maybe_img, context, debug=debug, diag=diag)
             else:
-                # Otherwise treat as a plain ingredient list
                 items_raw = parse_free_text(txt or "")
 
-        # ========= Normalize + expirations (dedupe) =========
+        # Normalize/dedupe + expirations
         now = datetime.utcnow()
         seen: set[str] = set()
         items_struct: List[Dict[str, Any]] = []
@@ -380,31 +494,106 @@ async def run(request: AgentRequest, response: AgentResponse, context: AgentCont
             if norm in seen:
                 continue
             seen.add(norm)
-            items_struct.append({
-                "name": raw,
-                "normalized": norm,
-                "expires_at": estimate_expiry(norm, now),
-            })
+            items_struct.append({"name": raw, "normalized": norm, "expires_at": estimate_expiry(norm, now)})
 
-        # ========= Recipe + Tutorials =========
-        items_text = ", ".join([i["normalized"] for i in items_struct]) or ", ".join(items_raw) or "nothing specified"
-        recipe_text = await llm_recipe_text(items_text)
-        vids = await youtube_search(f"how to make {items_text.split(',')[0].strip()}") if items_text else []
+        # Recipe + videos
+        items_text = ", ".join([i["normalized"] for i in items_struct]).strip()
+        if items_text:
+            recipe_text = await llm_recipe_text(items_text)
+            vids = await youtube_search(f"how to make {items_text.split(',')[0].strip()}") if items_text else []
+        else:
+            recipe_text = "I couldn’t detect any ingredients. Please send a clearer photo or type a short list (e.g., 'eggs, spinach, mozzarella, tomato')."
+            vids = []
 
-        return response.json({
+        # Optional video generation
+        video_info: Optional[Dict[str, Any]] = None
+        body = None
+        try:
+            if hasattr(request, "json"):
+                body = await _maybe_await(request.json())
+        except Exception:
+            body = None
+
+        meta = None
+        try:
+            if hasattr(request, "metadata"):
+                meta = await _maybe_await(request.metadata())
+        except Exception:
+            meta = None
+
+        gen_flag = False
+        if isinstance(body, dict) and body.get("generate_video"):
+            gen_flag = True
+        if isinstance(meta, dict) and meta.get("generate_video"):
+            gen_flag = True
+
+        selected_recipe_text = None
+        if isinstance(body, dict) and body.get("action") == "select_recipe":
+            selected_recipe_text = body.get("recipe") or body.get("recipe_text")
+            gen_flag = True
+        elif isinstance(meta, dict) and meta.get("action") == "select_recipe":
+            selected_recipe_text = meta.get("recipe")
+            gen_flag = True
+
+        if gen_flag:
+            prompt_text = selected_recipe_text or recipe_text
+            try:
+                video_info = await generate_and_store_video(context, request, prompt_text)
+            except Exception as e:
+                context.logger.error(f"Video generation helper failed: {e}")
+                video_info = {"error": "video_generation_exception"}
+
+        payload = {
             "items": items_struct,
             "recipe": recipe_text,
             "videos": vids,
-        })
+            "generated_video": video_info,
+        }
+        if debug:
+            payload["diagnostics"] = diag
+        return response.json(payload)
 
     except Exception as e:
         context.logger.error(f"Error running agent: {e}\n{traceback.format_exc()}")
         return response.json({
             "error": "agent_failed",
             "message": str(e),
-            "hint": (
-                "Verify OPENAI_API_KEY and payload shape. "
-                "You can always send an image as a data URL in JSON:\n"
-                '{"dataUrl":"data:image/jpeg;base64,...."}'
-            ),
+            "hint": ("Verify OPENAI_API_KEY and payload shape. You can send an image as a data URL in JSON:\n"
+                     '{"dataUrl":"data:image/jpeg;base64,...."}'),
         })
+
+async def generate_and_store_video(context: AgentContext, request: AgentRequest, prompt: str) -> Dict[str, Any]:
+    url = "https://ops-5--example-wan2-generate-video-http.modal.run"
+    headers = {"Accept": "video/mp4"}
+    params = {"prompt": prompt}
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client_httpx:
+            r = await client_httpx.get(url, params=params, headers=headers)
+            if r.status_code != 200:
+                context.logger.error(f"Video endpoint returned status {r.status_code}: {r.text}")
+                return {"error": "video_endpoint_error", "status": r.status_code}
+            content = r.content
+    except Exception as e:
+        context.logger.error(f"Error calling video endpoint: {e}")
+        return {"error": "video_call_exception"}
+
+    user_id = None
+    try:
+        user_id = getattr(request, "user_id", None)
+        if user_id is None and hasattr(request, "json"):
+            body = await _maybe_await(request.json())
+            if isinstance(body, dict):
+                user_id = body.get("user_id")
+    except Exception:
+        pass
+    if not user_id:
+        user_id = "owner"
+
+    key = f"video:{int(datetime.utcnow().timestamp())}:{user_id}"
+    try:
+        await context.kv.set("videos", key, base64.b64encode(content).decode())
+        return {"key": key, "size_bytes": len(content)}
+    except Exception as e:
+        context.logger.warn(f"Could not persist generated video to KV: {e}")
+        return {"size_bytes": len(content)}
