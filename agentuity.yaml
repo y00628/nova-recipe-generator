@@ -8,11 +8,11 @@
 # The version semver range required to run this project
 version: '>=0.0.179'
 # The ID of the project which is automatically generated
-project_id: proj_34885eecebb66e4f204dca18b79a2402
+project_id: proj_9db7d419b20629a24ecf7339b21d4931
 # The name of the project which is editable
 name: nova-recipe-generator
 # The description of the project which is editable
-description: ""
+description: ' AI recipe generator that creates recipes from ingredient lists or receipt photos'
 # The development configuration for the project
 development:
   # The port to run the development server on which can be overridden by setting the PORT environment variable
@@ -63,6 +63,6 @@ bundler:
 # The agents that are part of this project
 agents:
   - # The ID of the Agent which is automatically generated
-    id: agent_1e41f89388d471bbd2f9462c2e34250e
+    id: agent_f3cf7f8c0f13a04e3ae2911221d6ca5d
     # The name of the Agent which is editable
     name: my agent

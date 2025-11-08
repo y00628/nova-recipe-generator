@@ -3,8 +3,13 @@ from agentuity import AgentRequest, AgentResponse, AgentContext
 from openai import AsyncOpenAI
 import io
 import base64
+import os
 
-client = AsyncOpenAI()
+# Configure OpenAI client to use OpenRouter
+client = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY"),
+)
 
 
 def welcome():
@@ -110,10 +115,21 @@ async def run(request: AgentRequest, response: AgentResponse, context: AgentCont
                 try:
                     b64 = base64.b64encode(image_bytes).decode()
                     vision_result = await client.chat.completions.create(
-                        model="gpt-4o-mini",
+                        model="openai/gpt-4o-mini",
                         messages=[
-                            {"role": "system", "content": "Extract a list of ingredients from the image data passed as a data URI. If you cannot read the image, reply with an empty string."},
-                            {"role": "user", "content": f"data:{content_type};base64,{b64}"}
+                            {"role": "system", "content": "Extract a list of ingredients from the image. List only the ingredients you can identify, separated by commas."},
+                            {"role": "user", "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Please extract the ingredients from this receipt image."
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{content_type};base64,{b64}"
+                                    }
+                                }
+                            ]}
                         ],
                     )
                     user_input = vision_result.choices[0].message.content
@@ -143,7 +159,7 @@ async def run(request: AgentRequest, response: AgentResponse, context: AgentCont
 
         # Use the ingredients (user_input) to ask the recipe model
         recipe_result = await client.chat.completions.create(
-            model="gpt-5-mini",
+            model="openai/gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a chef assistant that creates concise recipes from given ingredients."},
                 {"role": "user", "content": f"I have: {user_input}. Suggest one or two simple recipes and describe steps."}
