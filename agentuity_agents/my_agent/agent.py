@@ -20,7 +20,11 @@ try:
 except Exception:
     PIL_AVAILABLE = False
 
-client = AsyncOpenAI()
+# Configure OpenAI client to use OpenRouter
+client = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY"),
+)
 
 # =========================
 # Helpers: normalization + expirations
@@ -566,7 +570,7 @@ async def generate_and_store_video(context: AgentContext, request: AgentRequest,
     params = {"prompt": prompt}
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client_httpx:
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client_httpx:
             r = await client_httpx.get(url, params=params, headers=headers)
             if r.status_code != 200:
                 context.logger.error(f"Video endpoint returned status {r.status_code}: {r.text}")
