@@ -1,0 +1,9 @@
+[project]
+name = "nova-recipe-generator"
+version = "0.1.0"
+description = ""
+requires-python = ">=3.10, <3.13"
+dependencies = [
+    "agentuity>=0.0.106",
+    "openai>=2.7.1",
+]
